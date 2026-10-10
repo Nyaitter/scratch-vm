@@ -31,6 +31,8 @@ class Blocks {
          * @type {Object.<string, Object>}
          */
         this._blocks = {};
+        // Each executing thread keeps its own applied generation.
+        this.editGeneration = 0;
 
         /**
          * All top-level scripts in the workspace.
@@ -394,8 +396,9 @@ class Blocks {
      * serves as a generic adapter between the blocks, variables, and the
      * runtime interface.
      * @param {object} e Blockly "block" or "variable" event
+     * @param {Target} optEditingTarget target context for a remote operation
      */
-    blocklyListen (e) {
+    blocklyListen (e, optEditingTarget) {
         // Validate event
         if (typeof e !== 'object') return;
         if (typeof e.blockId !== 'string' && typeof e.varId !== 'string' &&
@@ -403,7 +406,7 @@ class Blocks {
             return;
         }
         const stage = this.runtime.getTargetForStage();
-        const editingTarget = this.runtime.getEditingTarget();
+        const editingTarget = optEditingTarget || this.runtime.getEditingTarget();
 
         // UI event: clicked scripts toggle in the runtime.
         if (e.element === 'stackclick') {
@@ -427,7 +430,7 @@ class Blocks {
                 element: e.element,
                 name: e.name,
                 value: e.newValue
-            });
+            }, editingTarget);
             break;
         case 'move':
             this.moveBlock({
@@ -523,8 +526,8 @@ class Blocks {
         }
         case 'comment_create':
             this.resetCache(); // tw: comments can affect compilation
-            if (this.runtime.getEditingTarget()) {
-                const currTarget = this.runtime.getEditingTarget();
+            if (editingTarget) {
+                const currTarget = editingTarget;
                 currTarget.createComment(e.commentId, e.blockId, e.text,
                     e.xy.x, e.xy.y, e.width, e.height, e.minimized);
 
@@ -544,8 +547,8 @@ class Blocks {
             break;
         case 'comment_change':
             this.resetCache(); // tw: comments can affect compilation
-            if (this.runtime.getEditingTarget()) {
-                const currTarget = this.runtime.getEditingTarget();
+            if (editingTarget) {
+                const currTarget = editingTarget;
                 if (!Object.prototype.hasOwnProperty.call(currTarget.comments, e.commentId)) {
                     log.warn(`Cannot change comment with id ${e.commentId} because it does not exist.`);
                     return;
@@ -567,8 +570,8 @@ class Blocks {
             }
             break;
         case 'comment_move':
-            if (this.runtime.getEditingTarget()) {
-                const currTarget = this.runtime.getEditingTarget();
+            if (editingTarget) {
+                const currTarget = editingTarget;
                 if (currTarget && !Object.prototype.hasOwnProperty.call(currTarget.comments, e.commentId)) {
                     log.warn(`Cannot change comment with id ${e.commentId} because it does not exist.`);
                     return;
@@ -583,8 +586,8 @@ class Blocks {
             break;
         case 'comment_delete':
             this.resetCache(); // tw: comments can affect compilation
-            if (this.runtime.getEditingTarget()) {
-                const currTarget = this.runtime.getEditingTarget();
+            if (editingTarget) {
+                const currTarget = editingTarget;
                 if (!Object.prototype.hasOwnProperty.call(currTarget.comments, e.commentId)) {
                     // If we're in this state, we have probably received
                     // a delete event from a workspace that we switched from
@@ -614,6 +617,7 @@ class Blocks {
      * Reset all runtime caches.
      */
     resetCache () {
+        this.editGeneration++;
         this._cache.inputs = {};
         this._cache.procedureParamNames = {};
         this._cache.procedureDefinitions = {};
@@ -621,6 +625,7 @@ class Blocks {
         this._cache._monitored = null;
         this._cache.scripts = {};
         this._cache.compiledScripts = {};
+        this._cache.livePrograms = null;
         this._cache.compiledProcedures = {};
         this._cache.proceduresPopulated = false;
     }
@@ -664,8 +669,9 @@ class Blocks {
     /**
      * Block management: change block field values
      * @param {!object} args Blockly change event to be processed
+     * @param {Target} optEditingTarget target context for a remote operation
      */
-    changeBlock (args) {
+    changeBlock (args, optEditingTarget) {
         // Validate
         if (['field', 'mutation', 'checkbox'].indexOf(args.element) === -1) return;
         let block = this._blocks[args.id];
@@ -687,7 +693,7 @@ class Blocks {
             if (args.name === 'VARIABLE' || args.name === 'LIST' ||
                 args.name === 'BROADCAST_OPTION') {
                 // Get variable name using the id in args.value.
-                const variable = this.runtime.getEditingTarget().lookupVariableById(args.value);
+                const variable = (optEditingTarget || this.runtime.getEditingTarget()).lookupVariableById(args.value);
                 if (variable) {
                     block.fields[args.name].value = variable.name;
                     block.fields[args.name].id = args.value;
@@ -762,7 +768,7 @@ class Blocks {
                 // If creating a new sprite specific monitor, the only possible target is
                 // the current editing one b/c you cannot dynamically create monitors.
                 // Also, do not change the targetId if it has already been assigned
-                block.targetId = block.targetId || this.runtime.getEditingTarget().id;
+                block.targetId = block.targetId || (optEditingTarget || this.runtime.getEditingTarget()).id;
             } else {
                 block.targetId = null;
             }
@@ -803,6 +809,7 @@ class Blocks {
         }
 
         const block = this._blocks[e.id];
+        const wasTopLevel = block.topLevel;
         // Track whether a change actually occurred
         // ignoring changes like routine re-positioning
         // of a block when loading a workspace
@@ -834,7 +841,7 @@ class Blocks {
 
         // Is this block a top-level block?
         if (typeof e.newParent === 'undefined') {
-            this._addScript(e.id);
+            if (!wasTopLevel) this._addScript(e.id);
         } else {
             // Remove script, if one exists.
             this._deleteScript(e.id);
@@ -864,7 +871,9 @@ class Blocks {
             this._blocks[e.id].parent = e.newParent;
             didChange = true;
         }
-        this.resetCache();
+        if (!wasTopLevel || typeof e.oldParent !== 'undefined' || typeof e.newParent !== 'undefined') {
+            this.resetCache();
+        }
 
         if (didChange) this.emitProjectChanged();
     }

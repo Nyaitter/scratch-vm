@@ -363,8 +363,11 @@ class Sequencer {
      * @param {!Thread} thread Thread object to retire.
      */
     retireThread (thread) {
-        thread.stack = [];
-        thread.stackFrame = [];
+        thread.stack.length = 0;
+        if (thread.stackFrame) thread.stackFrame.length = 0;
+        else thread.stackFrame = [];
+        if (thread.liveExecution) thread.liveExecution.dispose();
+        thread.liveExecution = null;
         thread.requestScriptGlowInFrame = false;
         thread.status = Thread.STATUS_DONE;
         if (thread.isCompiled) {

@@ -199,6 +199,10 @@ class Thread {
         this.justReported = null;
 
         this.triedToCompile = false;
+        this.liveExecution = null;
+        this.cachedId = null;
+        this.cachedTargetId = null;
+        this.cachedTopBlock = null;
 
         this.isCompiled = false;
 
@@ -274,7 +278,12 @@ class Thread {
     }
 
     getId () {
-        return Thread.getIdFromTargetAndBlock(this.target, this.topBlock);
+        if (this.cachedId === null || this.cachedTargetId !== this.target.id || this.cachedTopBlock !== this.topBlock) {
+            this.cachedTargetId = this.target.id;
+            this.cachedTopBlock = this.topBlock;
+            this.cachedId = Thread.getIdFromTargetAndBlock(this.target, this.topBlock);
+        }
+        return this.cachedId;
     }
 
     /**
@@ -470,6 +479,18 @@ class Thread {
             return;
         }
 
+        if (this.target.runtime.compilerOptions.liveEditing && !this.updateMonitor) {
+            this.triedToCompile = true;
+            const {LiveExecution} = require('../compiler/live-runtime');
+            this.liveExecution = new LiveExecution(this);
+            this.generator = this.liveExecution;
+            this.isCompiled = true;
+            if (!this.blockContainer.forceNoGlow) {
+                this.blockGlowInFrame = this.topBlock;
+                this.requestScriptGlowInFrame = true;
+            }
+            return;
+        }
         // importing the compiler here avoids circular dependency issues
         const compile = require('../compiler/compile');
 

@@ -38,6 +38,7 @@ const setupUnsandboxedExtensionAPI = vm => new Promise(resolve => {
         register
     };
     Scratch.vm = vm;
+    Scratch.nditor = require('../nyaitter/extension-api').createAPI(vm);
     Scratch.renderer = vm.runtime.renderer;
 
     Scratch.canFetch = async url => {

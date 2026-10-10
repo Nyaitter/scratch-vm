@@ -19,9 +19,12 @@ test('ask and answer with a hidden target', t => {
 
     const expectedQuestion = 'a question';
     const expectedAnswer = 'the answer';
+    const questions = [];
 
     // Test is written out of order because of promises, follow the (#) comments.
     rt.addListener('QUESTION', question => {
+        questions.push(question);
+        if (question === null) return;
         // (2) Assert the question is correct, then emit the answer
         t.strictEqual(question, expectedQuestion);
         rt.emit('ANSWER', expectedAnswer);
@@ -33,6 +36,7 @@ test('ask and answer with a hidden target', t => {
     // (3) Ask block resolves after the answer is emitted.
     promise.then(() => {
         t.strictEqual(s.getAnswer(), expectedAnswer);
+        t.same(questions, [expectedQuestion, null]);
         t.end();
     });
 });
@@ -137,6 +141,7 @@ test('ask and answer with a visible target', t => {
     });
 
     rt.addListener('QUESTION', question => {
+        if (question === null) return;
         // Question should be blank for a visible target
         t.strictEqual(question, '');
 
@@ -159,7 +164,9 @@ test('answer gets reset when runtime is disposed', t => {
     const util = {target: {visible: false}};
     const expectedAnswer = 'the answer';
 
-    rt.addListener('QUESTION', () => rt.emit('ANSWER', expectedAnswer));
+    rt.addListener('QUESTION', question => {
+        if (question !== null) rt.emit('ANSWER', expectedAnswer);
+    });
     const promise = s.askAndWait({QUESTION: ''}, util);
 
     promise.then(() => t.strictEqual(s.getAnswer(), expectedAnswer))

@@ -90,6 +90,10 @@ Object.assign(global.Scratch, ScratchCommon, {
     download: () => Promise.reject(new Error('Scratch.download not supported in sandboxed extensions')),
     translate
 });
+global.Scratch.nditor = {
+    version: 1,
+    readHost: request => dispatch.call('extensions', 'readNditorHost', request)
+};
 
 /**
  * Expose only specific parts of the worker to extensions.

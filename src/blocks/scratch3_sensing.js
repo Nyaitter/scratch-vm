@@ -134,6 +134,12 @@ class Scratch3SensingBlocks {
         this._questionList.push([question, resolve, target, wasVisible, wasStage]);
     }
 
+    _showQuestion (question) {
+        this.runtime._collaborationQuestion = question;
+        this.runtime._collaborationQuestionInput = '';
+        this.runtime.emit('QUESTION', question);
+    }
+
     _askNextQuestion () {
         if (this._questionList.length > 0) {
             const [question, _resolve, target, wasVisible, wasStage] = this._questionList[0];
@@ -141,16 +147,18 @@ class Scratch3SensingBlocks {
             // say event to trigger a bubble unless the target was the stage.
             if (wasVisible && !wasStage) {
                 this.runtime.emit('SAY', target, 'say', question);
-                this.runtime.emit('QUESTION', '');
+                this._showQuestion('');
             } else {
-                this.runtime.emit('QUESTION', question);
+                this._showQuestion(question);
             }
+        } else {
+            this._showQuestion(null);
         }
     }
 
     _clearAllQuestions () {
         this._questionList = [];
-        this.runtime.emit('QUESTION', null);
+        this._showQuestion(null);
     }
 
     _clearTargetQuestions (stopTarget) {
@@ -164,7 +172,7 @@ class Scratch3SensingBlocks {
             if (this._questionList.length > 0) {
                 this._askNextQuestion();
             } else {
-                this.runtime.emit('QUESTION', null);
+                this._showQuestion(null);
             }
         }
     }

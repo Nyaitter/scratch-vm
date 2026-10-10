@@ -288,6 +288,14 @@ class Runtime extends EventEmitter {
         this._scriptGlowsPreviousFrame = [];
 
         /**
+         * Top-level scripts running across every target. Collaboration guests
+         * can edit a different target than the host, so this cannot be limited
+         * to the host's current editing target like normal workspace glows.
+         * @type {!Array.<!string>}
+         */
+        this._collaborationScriptGlows = [];
+
+        /**
          * Number of non-monitor threads running during the previous frame.
          * @type {number}
          */
@@ -324,6 +332,7 @@ class Runtime extends EventEmitter {
          * Ordered map of all monitors, which are MonitorRecord objects.
          */
         this._monitorState = new MonitorState();
+        this._collaborationMonitorSourceIsRemote = false;
 
         /**
          * Whether the project is in "turbo mode."
@@ -461,7 +470,8 @@ class Runtime extends EventEmitter {
 
         this.compilerOptions = {
             enabled: true,
-            warpTimer: false
+            warpTimer: false,
+            liveEditing: true
         };
 
         this.debug = false;
@@ -537,6 +547,7 @@ class Runtime extends EventEmitter {
          * Total number of finished or errored scratch-storage load() requests since the runtime was created or cleared.
          */
         this.finishedAssetRequests = 0;
+
     }
 
     /**
@@ -571,6 +582,14 @@ class Runtime extends EventEmitter {
      */
     static get SCRIPT_GLOW_OFF () {
         return 'SCRIPT_GLOW_OFF';
+    }
+
+    /**
+     * Event name for collaboration script glow state changing.
+     * @const {string}
+     */
+    static get COLLABORATION_GLOWS_UPDATE () {
+        return 'COLLABORATION_GLOWS_UPDATE';
     }
 
     /**
@@ -735,6 +754,16 @@ class Runtime extends EventEmitter {
      */
     static get VISUAL_REPORT () {
         return 'VISUAL_REPORT';
+    }
+
+    /**
+     * Event name for a visual report including its execution target. This is
+     * consumed by collaboration so a guest can display a value evaluated by
+     * the host even when the host is editing another sprite.
+     * @const {string}
+     */
+    static get COLLABORATION_VISUAL_REPORT () {
+        return 'COLLABORATION_VISUAL_REPORT';
     }
 
     /**
@@ -1024,6 +1053,57 @@ class Runtime extends EventEmitter {
 
     getMonitorState () {
         return this._monitorState;
+    }
+
+    /**
+     * Apply authoritative monitor state received by collaboration.
+     *
+     * MonitorState.set intentionally performs a partial merge for normal VM
+     * monitor updates. Collaboration packets contain complete records instead,
+     * so replacing each record is required to preserve explicit null values
+     * such as auto-positioned x/y coordinates. This method also emits exactly
+     * one MONITORS_UPDATE for the batch and clears the dirty bit so the normal
+     * runtime step does not emit the same remote update a second time.
+     *
+     * @param {object[]} monitors Complete monitor records to add or replace.
+     * @param {string[]} removedMonitorIds Monitor IDs to remove.
+     * @param {boolean} full Remove every current monitor not in `monitors`.
+     * @returns {boolean} Whether a monitor update was emitted.
+     */
+    applyCollaborationMonitorState (monitors = [], removedMonitorIds = [], full = false) {
+        const records = Array.isArray(monitors) ? monitors : [];
+        const removed = Array.isArray(removedMonitorIds) ? removedMonitorIds : [];
+        const incomingIds = new Set(records
+            .filter(monitor => monitor && monitor.id !== null && typeof monitor.id !== 'undefined')
+            .map(monitor => monitor.id));
+        let changed = false;
+
+        if (full) {
+            this._monitorState.values().forEach(monitor => {
+                if (!incomingIds.has(monitor.id)) {
+                    this._monitorState.delete(monitor.id);
+                    changed = true;
+                }
+            });
+        }
+
+        removed.forEach(id => {
+            if (this._monitorState.has(id)) {
+                this._monitorState.delete(id);
+                changed = true;
+            }
+        });
+
+        records.forEach(monitor => {
+            if (!monitor || monitor.id === null || typeof monitor.id === 'undefined') return;
+            this._monitorState.map.set(monitor.id, new MonitorRecord(monitor));
+            changed = true;
+        });
+
+        if (!changed && !full) return false;
+        this._monitorState.dirty = false;
+        this.emit(Runtime.MONITORS_UPDATE, this._monitorState.shallowClone());
+        return true;
     }
 
     /**
@@ -2499,13 +2579,20 @@ class Runtime extends EventEmitter {
         }
     }
 
-    updateThreadMap () {
+    updateThreadMap (removeKilled = false) {
         this.threadMap.clear();
-        for (const thread of this.threads) {
+        let activeCount = 0;
+        for (let i = 0; i < this.threads.length; i++) {
+            const thread = this.threads[i];
+            if (removeKilled) {
+                if (thread.isKilled) continue;
+                this.threads[activeCount++] = thread;
+            }
             if (!thread.stackClick && !thread.updateMonitor) {
                 this.threadMap.set(thread.getId(), thread);
             }
         }
+        if (removeKilled) this.threads.length = activeCount;
     }
 
     /**
@@ -2525,8 +2612,7 @@ class Runtime extends EventEmitter {
         }
 
         // Clean up threads that were told to stop during or since the last step
-        this.threads = this.threads.filter(thread => !thread.isKilled);
-        this.updateThreadMap();
+        this.updateThreadMap(true);
 
         // Find all edge-activated hats, and add them to threads to be evaluated.
         for (const hatType in this._hats) {
@@ -2570,7 +2656,8 @@ class Runtime extends EventEmitter {
             // tw: do not draw if document is hidden or a rAF loop is running
             // Checking for the animation frame loop is more reliable than using
             // interpolationEnabled in some edge cases
-            if (!document.hidden && !this.frameLoop._interpolationAnimation) {
+            const isHidden = typeof document === 'undefined' ? false : document.hidden;
+            if (!isHidden && !this.frameLoop._interpolationAnimation) {
                 this.renderer.draw();
             }
             if (this.profiler !== null) {
@@ -2616,6 +2703,10 @@ class Runtime extends EventEmitter {
      * Queue monitor blocks to sequencer to be run.
      */
     _pushMonitors () {
+        // A collaboration guest displays the monitor records streamed by the
+        // host. Running these blocks locally would immediately replace values
+        // such as mouse down, timer and loudness with this browser's values.
+        if (this._collaborationMonitorSourceIsRemote) return;
         if (this.targets.length === 0) {
             // Project is not loaded yet, but monitors might be. Don't try to start anything.
             return;
@@ -2695,7 +2786,8 @@ class Runtime extends EventEmitter {
      * @param {*} compilerOptions New options
      */
     setCompilerOptions (compilerOptions) {
-        this.compilerOptions = Object.assign({}, this.compilerOptions, compilerOptions);
+        this.compilerOptions = Object.assign({}, this.compilerOptions, compilerOptions,
+            {enabled: true, liveEditing: true});
         this.resetAllCaches();
         this.emit(Runtime.COMPILER_OPTIONS_CHANGED, this.compilerOptions);
     }
@@ -2881,8 +2973,12 @@ class Runtime extends EventEmitter {
         if (parsed.runtimeOptions) {
             this.setRuntimeOptions(parsed.runtimeOptions);
         }
-        if (parsed.hq && this.renderer) {
-            this.renderer.setUseHighQualityRender(true);
+        if (parsed.compilerOptions) {
+            this.setCompilerOptions(parsed.compilerOptions);
+        }
+        if (typeof parsed.hq === 'boolean') {
+            this._storedHighQualityRender = parsed.hq;
+            this.renderer?.setUseHighQualityRender(parsed.hq);
         }
         const storedWidth = +parsed.width || this.stageWidth;
         const storedHeight = +parsed.height || this.stageHeight;
@@ -2895,9 +2991,10 @@ class Runtime extends EventEmitter {
         return {
             framerate: this.frameLoop.framerate,
             runtimeOptions: this.runtimeOptions,
+            compilerOptions: this.compilerOptions,
             interpolation: this.interpolationEnabled,
             turbo: this.turboMode,
-            hq: this.renderer ? this.renderer.useHighQualityRender : false,
+            hq: this.renderer ? this.renderer.useHighQualityRender : Boolean(this._storedHighQualityRender),
             width: this.stageWidth,
             height: this.stageHeight
         };
@@ -2964,20 +3061,20 @@ class Runtime extends EventEmitter {
      * @param {Array.<Thread>=} optExtraThreads Optional list of inactive threads.
      */
     _updateGlows (optExtraThreads) {
-        const searchThreads = [];
-        searchThreads.push(...this.threads);
-        if (optExtraThreads) {
-            searchThreads.push(...optExtraThreads);
-        }
+        if (this.threads.length === 0 && (!optExtraThreads || optExtraThreads.length === 0) &&
+            this._scriptGlowsPreviousFrame.length === 0 && this._collaborationScriptGlows.length === 0) return;
+        const searchThreads = this.threads.concat(optExtraThreads || []);
         // Set of scripts that request a glow this frame.
         const requestedGlowsThisFrame = [];
+        const collaborationGlowsThisFrame = [];
+        const collaborationGlowSet = new Set();
         // Final set of scripts glowing during this frame.
         const finalScriptGlows = [];
         // Find all scripts that should be glowing.
         for (let i = 0; i < searchThreads.length; i++) {
             const thread = searchThreads[i];
             const target = thread.target;
-            if (target === this._editingTarget) {
+            if (target) {
                 const blockForThread = thread.blockGlowInFrame;
                 if (thread.requestScriptGlowInFrame || thread.stackClick) {
                     let script = target.blocks.getTopLevelScript(blockForThread);
@@ -2988,25 +3085,34 @@ class Runtime extends EventEmitter {
                         );
                     }
                     if (script) {
-                        requestedGlowsThisFrame.push(script);
+                        if (!collaborationGlowSet.has(script)) {
+                            collaborationGlowSet.add(script);
+                            collaborationGlowsThisFrame.push(script);
+                        }
+                        if (target === this._editingTarget) requestedGlowsThisFrame.push(script);
                     }
                 }
             }
         }
+        if (collaborationGlowsThisFrame.length !== this._collaborationScriptGlows.length ||
+            collaborationGlowsThisFrame.some((id, index) => id !== this._collaborationScriptGlows[index])) {
+            this._collaborationScriptGlows = collaborationGlowsThisFrame;
+            this.emit(Runtime.COLLABORATION_GLOWS_UPDATE, collaborationGlowsThisFrame);
+        }
+        const requestedGlowSet = new Set(requestedGlowsThisFrame);
+        const previousGlowSet = new Set(this._scriptGlowsPreviousFrame);
         // Compare to previous frame.
         for (let j = 0; j < this._scriptGlowsPreviousFrame.length; j++) {
             const previousFrameGlow = this._scriptGlowsPreviousFrame[j];
-            if (requestedGlowsThisFrame.indexOf(previousFrameGlow) < 0) {
-                // Glow turned off.
-                this.glowScript(previousFrameGlow, false);
-            } else {
-                // Still glowing.
+            if (requestedGlowSet.has(previousFrameGlow)) {
                 finalScriptGlows.push(previousFrameGlow);
+            } else {
+                this.glowScript(previousFrameGlow, false);
             }
         }
         for (let k = 0; k < requestedGlowsThisFrame.length; k++) {
             const currentFrameGlow = requestedGlowsThisFrame[k];
-            if (this._scriptGlowsPreviousFrame.indexOf(currentFrameGlow) < 0) {
+            if (!previousGlowSet.has(currentFrameGlow)) {
                 // Glow turned on.
                 this.glowScript(currentFrameGlow, true);
                 finalScriptGlows.push(currentFrameGlow);
@@ -3094,11 +3200,16 @@ class Runtime extends EventEmitter {
      * @param {string} value Value to show associated with the block.
      */
     visualReport (target, blockId, value) {
+        const report = {
+            id: blockId,
+            value: safeStringify(value)
+        };
+        this.emit(Runtime.COLLABORATION_VISUAL_REPORT, {
+            ...report,
+            targetId: target?.id || null
+        });
         if (target === this.getEditingTarget()) {
-            this.emit(Runtime.VISUAL_REPORT, {
-                id: blockId,
-                value: safeStringify(value)
-            });
+            this.emit(Runtime.VISUAL_REPORT, report);
         }
     }
 

@@ -193,6 +193,9 @@ class Scratch3PenBlocks {
     _onTargetMoved (target, oldX, oldY, isForce) {
         // Only move the pen if the movement isn't forced (ie. dragged).
         if (!isForce) {
+            this._recordDrawing({type: 'line',
+                attributes: this._getPenState(target).penAttributes,
+                coordinates: [oldX, oldY, target.x, target.y]});
             const penSkinId = this._getPenLayerID();
             if (penSkinId >= 0) {
                 const penState = this._getPenState(target);
@@ -519,6 +522,7 @@ class Scratch3PenBlocks {
      * The pen "clear" block clears the pen layer's contents.
      */
     clear () { // used by compiler
+        this._recordDrawing({type: 'clear'});
         const penSkinId = this._getPenLayerID();
         if (penSkinId >= 0) {
             this.runtime.renderer.penClear(penSkinId);
@@ -535,6 +539,16 @@ class Scratch3PenBlocks {
         this._stamp(util.target);
     }
     _stamp (target) { // used by compiler
+        this._recordDrawing({type: 'stamp',
+            targetId: target.id,
+            originalTargetId: target.sprite.clones[0].id,
+            state: {x: target.x,
+                y: target.y,
+                direction: target.direction,
+                size: target.size,
+                currentCostume: target.currentCostume,
+                rotationStyle: target.rotationStyle,
+                effects: target.effects}});
         const penSkinId = this._getPenLayerID();
         if (penSkinId >= 0) {
             this.runtime.renderer.penStamp(penSkinId, target.drawableID);
@@ -559,6 +573,7 @@ class Scratch3PenBlocks {
         }
 
         const penSkinId = this._getPenLayerID();
+        this._recordDrawing({type: 'point', attributes: penState.penAttributes, coordinates: [target.x, target.y]});
         if (penSkinId >= 0) {
             this.runtime.renderer.penPoint(penSkinId, penState.penAttributes, target.x, target.y);
             this.runtime.requestRedraw();
@@ -580,6 +595,54 @@ class Scratch3PenBlocks {
             penState.penDown = false;
             target.onTargetMoved = null;
         }
+    }
+
+    // Retain the authoritative drawing commands, including intermediate moves
+    // which cannot be reconstructed from the frame's final sprite position.
+    _recordDrawing (command) {
+        if (!this.runtime._nditorPenTracking) return;
+        if (command.type === 'clear') this.runtime._nditorPenCommands = [];
+        const commands = this.runtime._nditorPenCommands || (this.runtime._nditorPenCommands = []);
+        commands.push(JSON.parse(JSON.stringify(command)));
+        this.runtime._nditorPenSequence = (this.runtime._nditorPenSequence || 0) + 1;
+    }
+
+    replayDrawing (commands, resolveTarget) {
+        const renderer = this.runtime.renderer;
+        const skin = this._getPenLayerID();
+        if (!renderer || skin < 0) return;
+        for (const command of commands) {
+            if (command.type === 'clear') renderer.penClear(skin);
+            else if (command.type === 'line') renderer.penLine(skin, command.attributes, ...command.coordinates);
+            else if (command.type === 'point') renderer.penPoint(skin, command.attributes, ...command.coordinates);
+            else if (command.type === 'stamp') {
+                const target = resolveTarget(command.targetId) || resolveTarget(command.originalTargetId);
+                if (!target || target.drawableID === null) continue;
+                const previous = {};
+                const update = () => {
+                    const rendered = target._getRenderedDirectionAndScale();
+                    renderer.updateDrawablePosition(target.drawableID, [target.x, target.y]);
+                    renderer.updateDrawableDirectionScale(target.drawableID, rendered.direction, rendered.scale);
+                    const costume = target.getCostumes()[target.currentCostume];
+                    if (costume) renderer.updateDrawableSkinId(target.drawableID, costume.skinId);
+                    for (const effect of Object.keys(target.effects)) {
+                        renderer.updateDrawableEffect(target.drawableID, effect, target.effects[effect]);
+                    }
+                };
+                for (const key of Object.keys(command.state)) {
+                    previous[key] = target[key];
+                    target[key] = command.state[key];
+                }
+                try {
+                    update();
+                    renderer.penStamp(skin, target.drawableID);
+                } finally {
+                    Object.assign(target, previous);
+                    update();
+                }
+            }
+        }
+        this.runtime.requestRedraw();
     }
 
     /**

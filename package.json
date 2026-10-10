@@ -4,10 +4,10 @@
   "description": "Virtual Machine for Scratch 3.0",
   "author": "Massachusetts Institute of Technology",
   "license": "MPL-2.0",
-  "homepage": "https://github.com/scratchfoundation/scratch-vm#readme",
+  "homepage": "https://github.com/Nyaitter/scratch-vm",
   "repository": {
     "type": "git",
-    "url": "https://github.com/scratchfoundation/scratch-vm.git"
+    "url": "https://github.com/Nyaitter/scratch-vm.git"
   },
   "main": "./src/index.js",
   "browser": "./src/index.js",
@@ -39,8 +39,6 @@
     "@turbowarp/nanolog": "^0.2.0",
     "@vernier/godirect": "1.5.0",
     "arraybuffer-loader": "^1.0.6",
-    "atob": "2.1.2",
-    "btoa": "1.2.1",
     "canvas-toBlob": "1.0.0",
     "decode-html": "2.0.0",
     "diff-match-patch": "1.0.4",
@@ -51,7 +49,8 @@
     "scratch-translate-extension-languages": "^1.0.7",
     "text-encoding": "0.7.0",
     "uuid": "8.3.2",
-    "worker-loader": "^1.1.1"
+    "worker-loader": "^1.1.1",
+    "pngjs": "3.3.3"
   },
   "peerDependencies": {
     "@turbowarp/scratch-svg-renderer": "^1.1.0"
@@ -75,7 +74,6 @@
     "jsdoc": "3.6.6",
     "json": "^9.0.4",
     "lodash.defaultsdeep": "4.6.1",
-    "pngjs": "3.3.3",
     "scratch-audio": "0.1.0-prerelease.20231221012053",
     "scratch-blocks": "0.1.0-prerelease.20230527085947",
     "scratch-l10n": "3.16.20231222031921",

@@ -641,6 +641,16 @@ const scopedEval = source => {
     }
 };
 
+execute.runFunction = (thread, fn) => {
+    const previous = globalState.thread;
+    globalState.thread = thread;
+    try {
+        return fn();
+    } finally {
+        globalState.thread = previous;
+    }
+};
+
 execute.scopedEval = scopedEval;
 execute.runtimeFunctions = runtimeFunctions;
 execute.saveGlobalState = saveGlobalState;

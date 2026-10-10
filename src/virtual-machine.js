@@ -13,10 +13,12 @@ const ExtensionManager = require('./extension-support/extension-manager');
 const log = require('./util/log');
 const MathUtil = require('./util/math-util');
 const Runtime = require('./engine/runtime');
+const MonitorRecord = require('./engine/monitor-record');
 const RenderedTarget = require('./sprites/rendered-target');
 const Sprite = require('./sprites/sprite');
 const StringUtil = require('./util/string-util');
 const formatMessage = require('format-message');
+const ExtendedJSON = require('@turbowarp/json');
 
 const Variable = require('./engine/variable');
 const newBlockIds = require('./util/new-block-ids');
@@ -27,8 +29,125 @@ const {serializeSounds, serializeCostumes} = require('./serialization/serialize-
 require('canvas-toBlob');
 const {exportCostume} = require('./serialization/tw-costume-import-export');
 const Base64Util = require('./util/base64-util');
+const CollaborationController = require('./nyaitter/collaboration-controller');
+const {mergeCostumeUpdate, mergeVectorCostumes} = require('./nyaitter/merge-costume');
 
 const RESERVED_NAMES = ['_mouse_', '_stage_', '_edge_', '_myself_', '_random_'];
+const COLLABORATION_BLOCK_EVENTS = new Set([
+    'create',
+    'delete',
+    'change',
+    'move',
+    'var_create',
+    'var_delete',
+    'var_rename',
+    'comment_create',
+    'comment_change',
+    'comment_move',
+    'comment_delete'
+]);
+
+const serializeCollaborationBlockEvent = (event, target) => {
+    if (!event || !COLLABORATION_BLOCK_EVENTS.has(event.type) || typeof event.toJson !== 'function') {
+        return null;
+    }
+    const data = event.toJson();
+    if (event.xy) data.xy = {x: event.xy.x, y: event.xy.y};
+    if (event.newContents_) {
+        data.newContents = JSON.parse(JSON.stringify(event.newContents_));
+        data.newValue = data.newContents;
+    }
+    if (event.newCoordinate_) {
+        data.newCoordinateObject = {x: event.newCoordinate_.x, y: event.newCoordinate_.y};
+    }
+    ['text', 'width', 'height', 'minimized'].forEach(key => {
+        if (typeof event[key] !== 'undefined') data[key] = event[key];
+    });
+    if (event.type.indexOf('var_') === 0) {
+        data.variableIsLocal = Boolean(event.isLocal || (
+            target && !target.isStage && Object.prototype.hasOwnProperty.call(target.variables, event.varId)
+        ));
+    }
+    return data;
+};
+
+const serializeCollaborationCostume = costume => {
+    if (!costume?.asset?.data) return null;
+    const result = {};
+    Object.keys(costume).forEach(key => {
+        if (!['asset', 'skinId', 'broken'].includes(key)) result[key] = costume[key];
+    });
+    result.assetData = {
+        assetId: costume.asset.assetId || costume.assetId || null,
+        dataFormat: costume.asset.dataFormat || costume.dataFormat,
+        data: Base64Util.uint8ArrayToBase64(costume.asset.data)
+    };
+    return result;
+};
+
+const paintEditBase = (current, edit) => {
+    if (!current || !edit || (!edit.svg && !edit.data)) return current;
+    return {...current,
+        rotationCenterX: edit.rotationCenterX,
+        rotationCenterY: edit.rotationCenterY,
+        bitmapResolution: edit.bitmapResolution || current.bitmapResolution,
+        assetData: {assetId: edit.assetId || null,
+            dataFormat: edit.svg ? 'svg' : edit.dataFormat,
+            data: edit.svg ? Base64Util.uint8ArrayToBase64(new _TextEncoder().encode(edit.svg)) : edit.data}};
+};
+
+const deserializeCollaborationCostume = (runtime, source) => {
+    if (!source?.assetData?.data || !runtime.storage) return null;
+    const costume = JSON.parse(JSON.stringify(source));
+    const descriptor = costume.assetData;
+    const format = String(descriptor.dataFormat || costume.dataFormat || '').toLowerCase();
+    const assetType = format === 'svg' ? runtime.storage.AssetType.ImageVector :
+        runtime.storage.AssetType.ImageBitmap;
+    costume.asset = runtime.storage.createAsset(
+        assetType,
+        descriptor.dataFormat || costume.dataFormat,
+        Base64Util.base64ToUint8Array(descriptor.data),
+        descriptor.assetId || costume.assetId || null,
+        !descriptor.assetId && !costume.assetId
+    );
+    costume.assetId = costume.asset.assetId;
+    costume.dataFormat = costume.asset.dataFormat;
+    costume.md5 = `${costume.assetId}.${costume.dataFormat}`;
+    delete costume.assetData;
+    return costume;
+};
+
+const serializeCollaborationSound = sound => {
+    if (!sound?.asset?.data) return null;
+    const result = {};
+    Object.keys(sound).forEach(key => {
+        if (!['asset', 'soundId', 'broken'].includes(key)) result[key] = sound[key];
+    });
+    result.assetData = {
+        assetId: sound.asset.assetId || sound.assetId || null,
+        dataFormat: sound.asset.dataFormat || sound.dataFormat,
+        data: Base64Util.uint8ArrayToBase64(sound.asset.data)
+    };
+    return result;
+};
+
+const deserializeCollaborationSound = (runtime, source) => {
+    if (!source?.assetData?.data || !runtime.storage) return null;
+    const sound = JSON.parse(JSON.stringify(source));
+    const descriptor = sound.assetData;
+    sound.asset = runtime.storage.createAsset(
+        runtime.storage.AssetType.Sound,
+        descriptor.dataFormat || sound.dataFormat,
+        Base64Util.base64ToUint8Array(descriptor.data),
+        descriptor.assetId || sound.assetId || null,
+        false
+    );
+    sound.assetId = sound.asset.assetId;
+    sound.dataFormat = sound.asset.dataFormat;
+    sound.md5 = `${sound.assetId}.${sound.dataFormat}`;
+    delete sound.assetData;
+    return sound;
+};
 
 const CORE_EXTENSIONS = [
     // 'motion',
@@ -83,6 +202,8 @@ class VirtualMachine extends EventEmitter {
          * @type {Target}
          */
         this._dragTarget = null;
+        this._collaborationRuntimeHandler = null;
+        this._collaborationForwardedMonitorEvents = new WeakSet();
 
         // Runtime emits are passed along as VM emits.
         this.runtime.on(Runtime.SCRIPT_GLOW_ON, glowData => {
@@ -111,6 +232,9 @@ class VirtualMachine extends EventEmitter {
         });
         this.runtime.on(Runtime.VISUAL_REPORT, visualReport => {
             this.emit(Runtime.VISUAL_REPORT, visualReport);
+        });
+        this.runtime.on(Runtime.COLLABORATION_VISUAL_REPORT, visualReport => {
+            this.emit(Runtime.COLLABORATION_VISUAL_REPORT, visualReport);
         });
         this.runtime.on(Runtime.TARGETS_UPDATE, emitProjectChanged => {
             this.emitTargetsUpdate(emitProjectChanged);
@@ -285,6 +409,7 @@ class VirtualMachine extends EventEmitter {
      * "Green flag" handler - start all threads starting with a green flag.
      */
     greenFlag () {
+        if (this._collaborationRuntimeHandler?.({command: 'green_flag'})) return;
         this.runtime.greenFlag();
     }
 
@@ -335,6 +460,10 @@ class VirtualMachine extends EventEmitter {
         this.runtime.setInEditor(inEditor);
     }
 
+    notifyCollaborationOptionsChanged () {
+        this.emit('collaborationOptionsChanged');
+    }
+
     convertToPackagedRuntime () {
         this.runtime.convertToPackagedRuntime();
     }
@@ -349,6 +478,11 @@ class VirtualMachine extends EventEmitter {
 
     storeProjectOptions () {
         this.runtime.storeProjectOptions();
+        const comment = this.runtime.findProjectOptionsComment();
+        this._emitCollaborationOperation('project.options', {
+            data: ExtendedJSON.stringify(this.runtime._generateAllProjectOptions()),
+            commentId: comment?.id || null
+        });
         if (this.editingTarget.isStage) {
             this.emitWorkspaceUpdate();
         }
@@ -367,6 +501,7 @@ class VirtualMachine extends EventEmitter {
      * Stop all threads and running activities.
      */
     stopAll () {
+        if (this._collaborationRuntimeHandler?.({command: 'stop_all'})) return;
         this.runtime.stopAll();
     }
 
@@ -403,6 +538,11 @@ class VirtualMachine extends EventEmitter {
      * @param {object} data Any data object to post to the I/O device.
      */
     postIOData (device, data) {
+        if ((device === 'mouse' || device === 'keyboard') && this._collaborationRuntimeHandler?.({
+            command: 'runtime_input',
+            device,
+            data
+        })) return;
         if (this.runtime.ioDevices[device]) {
             this.runtime.ioDevices[device].postData(data);
         }
@@ -592,6 +732,390 @@ class VirtualMachine extends EventEmitter {
     }
 
     /**
+     * Create the VM boundary used by Nditor collaboration.
+     * @param {object} options collaboration callbacks and role
+     * @returns {CollaborationController} a closable collaboration controller
+     */
+    createCollaborationController (options) {
+        return new CollaborationController(this, options);
+    }
+
+    /**
+     * Redirect editor runtime actions while this VM is a collaboration guest.
+     * @param {?Function} handler command handler, or null to run locally
+     */
+    setCollaborationRuntimeHandler (handler) {
+        this._collaborationRuntimeHandler = typeof handler === 'function' ? handler : null;
+        this.runtime._collaborationMonitorSourceIsRemote = Boolean(this._collaborationRuntimeHandler);
+    }
+
+    _serializeCollaborationBlockTree (container, blockId) {
+        const serialized = [];
+        const visited = new Set();
+        const visit = id => {
+            if (!id || visited.has(id)) return;
+            const block = container?.getBlock?.(id);
+            if (!block) return;
+            visited.add(id);
+            serialized.push(JSON.parse(JSON.stringify(block)));
+            Object.values(block.inputs || {}).forEach(input => {
+                visit(input?.block);
+                visit(input?.shadow);
+            });
+            visit(block.next);
+        };
+        visit(blockId);
+        return serialized;
+    }
+
+    _forwardCollaborationMonitorEvent (event) {
+        if (!event || event.type !== 'change' || event.element !== 'checkbox') return false;
+        if (this._collaborationForwardedMonitorEvents.has(event)) return true;
+        const block = this.runtime.monitorBlocks.getBlock(event.blockId) ||
+            this.runtime.flyoutBlocks.getBlock(event.blockId);
+        if (!block) return false;
+        const handled = this._collaborationRuntimeHandler?.({
+            command: 'monitor_visibility',
+            targetId: this.editingTarget?.id || null,
+            event: {
+                type: 'change',
+                blockId: event.blockId,
+                element: 'checkbox',
+                name: event.name || null,
+                newValue: Boolean(event.newValue)
+            },
+            block: JSON.parse(JSON.stringify(block))
+        });
+        if (handled) this._collaborationForwardedMonitorEvents.add(event);
+        return Boolean(handled);
+    }
+
+    /**
+     * Install the flyout reporter data sent by a guest before evaluating it on
+     * the host VM. Flyout blocks are transient and are not part of the project.
+     * @param {object[]} blocks serialized VM blocks
+     */
+    installCollaborationFlyoutBlocks (blocks) {
+        if (!Array.isArray(blocks)) return;
+        const incomingIds = new Set();
+        blocks.slice(0, 256).forEach(block => {
+            if (!block || typeof block.id !== 'string' || typeof block.opcode !== 'string') return;
+            const copy = JSON.parse(JSON.stringify(block));
+            incomingIds.add(copy.id);
+            this.runtime.flyoutBlocks._blocks[copy.id] = copy;
+        });
+        this.runtime.flyoutBlocks._scripts = this.runtime.flyoutBlocks._scripts
+            .filter(id => !incomingIds.has(id));
+        blocks.forEach(block => {
+            if (block?.topLevel && incomingIds.has(block.id)) this.runtime.flyoutBlocks._scripts.push(block.id);
+        });
+        this.runtime.flyoutBlocks.resetCache();
+    }
+
+    /**
+     * Apply a guest monitor checkbox to the host monitor model.
+     * @param {string} targetId local host target ID
+     * @param {object} event serialized checkbox event
+     * @param {object} block serialized monitor block
+     * @returns {boolean} whether the monitor request was applied
+     */
+    applyCollaborationMonitorVisibility (targetId, event, block) {
+        const target = this.runtime.getTargetById(targetId);
+        if (!target || !event || !block || typeof block.id !== 'string') return false;
+        const copy = JSON.parse(JSON.stringify(block));
+        copy.targetId = null;
+        this.runtime.monitorBlocks._blocks[copy.id] = copy;
+        if (copy.topLevel && !this.runtime.monitorBlocks._scripts.includes(copy.id)) {
+            this.runtime.monitorBlocks._scripts.push(copy.id);
+        }
+        this.runtime.monitorBlocks.resetCache();
+        this.runtime.monitorBlocks.blocklyListen(event, target);
+        return true;
+    }
+
+    _emitCollaborationOperation (kind, data) {
+        if (!kind) return;
+        this.emit('collaborationOperation', {kind, ...data});
+    }
+
+    _findCostumeOwner (costume) {
+        for (const target of this.runtime.targets) {
+            const costumeIndex = target.sprite?.costumes?.indexOf(costume);
+            if (costumeIndex >= 0) return {target, costumeIndex};
+        }
+        return null;
+    }
+
+    _emitCostumeUpdate (costume, baseCostume = null) {
+        const owner = this._findCostumeOwner(costume);
+        const serialized = serializeCollaborationCostume(costume);
+        if (!owner || !serialized) return;
+        this._emitCollaborationOperation('costume.update', {
+            targetId: owner.target.id,
+            costumeIndex: owner.costumeIndex,
+            costume: serialized,
+            ...(baseCostume ? {baseCostume} : {})
+        });
+    }
+
+    _findSoundOwner (sound) {
+        for (const target of this.runtime.targets) {
+            const soundIndex = target.sprite?.sounds?.indexOf(sound);
+            if (soundIndex >= 0) return {target, soundIndex};
+        }
+        return null;
+    }
+
+    _emitSoundUpdate (sound) {
+        const owner = this._findSoundOwner(sound);
+        const serialized = serializeCollaborationSound(sound);
+        if (!owner || !serialized) return;
+        this._emitCollaborationOperation('sound.update', {
+            targetId: owner.target.id,
+            soundIndex: owner.soundIndex,
+            sound: serialized
+        });
+    }
+
+    async _emitSpriteAdd (target) {
+        if (!target?.isSprite?.()) return;
+        const data = await this.exportSprite(target.id, 'arraybuffer');
+        this._emitCollaborationOperation('sprite.add', {
+            targetId: target.id,
+            targetIndex: this.runtime.targets.indexOf(target),
+            sprite: Base64Util.arrayBufferToBase64(data)
+        });
+    }
+
+    async _loadCollaborationCostume (source) {
+        const costume = deserializeCollaborationCostume(this.runtime, source);
+        if (!costume) throw new Error('The collaboration costume has no asset.');
+        await loadCostume(costume.md5, costume, this.runtime);
+        if (costume.broken || (this.runtime.renderer && typeof costume.skinId !== 'number')) {
+            throw new Error(`Unable to load costume: ${costume.name || costume.md5}`);
+        }
+        return costume;
+    }
+
+    async _loadCollaborationSound (target, source) {
+        const sound = deserializeCollaborationSound(this.runtime, source);
+        if (!sound) throw new Error('The collaboration sound has no asset.');
+        await loadSound(sound, this.runtime, target.sprite.soundBank);
+        if (sound.broken) throw new Error(`Unable to load sound: ${sound.name || sound.md5}`);
+        return sound;
+    }
+
+    /**
+     * Apply one ordered collaboration operation without changing the editor's
+     * selected sprite or emitting the operation again.
+     * @param {object} operation collaboration operation
+     * @returns {Promise<void>} resolves after assets are decoded
+     */
+    async applyCollaborationOperation (operation) {
+        if (!operation?.kind) return;
+        if (operation.kind === 'runtime.options' && typeof operation.data === 'string') {
+            const options = ExtendedJSON.parse(operation.data);
+            if (!options || typeof options !== 'object') return;
+            if (typeof options.framerate === 'number') this.runtime.setFramerate(options.framerate);
+            if (typeof options.turbo === 'boolean') this.setTurboMode(options.turbo);
+            if (typeof options.interpolation === 'boolean') this.runtime.setInterpolation(options.interpolation);
+            if (options.runtimeOptions) this.runtime.setRuntimeOptions(options.runtimeOptions);
+            if (options.compilerOptions) this.runtime.setCompilerOptions(options.compilerOptions);
+            if (typeof options.hq === 'boolean') {
+                this.runtime._storedHighQualityRender = options.hq;
+                this.runtime.renderer?.setUseHighQualityRender(options.hq);
+            }
+            if (Number(options.width) > 0 && Number(options.height) > 0) {
+                this.runtime.setStageSize(Number(options.width), Number(options.height));
+            }
+            return;
+        }
+        if (operation.kind === 'project.options' && typeof operation.data === 'string') {
+            const options = ExtendedJSON.parse(operation.data);
+            if (!options || typeof options !== 'object') return;
+            if (typeof options.framerate === 'number') this.runtime.setFramerate(options.framerate);
+            this.setTurboMode(Boolean(options.turbo));
+            this.runtime.setInterpolation(Boolean(options.interpolation));
+            if (options.runtimeOptions) this.runtime.setRuntimeOptions(options.runtimeOptions);
+            if (options.compilerOptions) this.runtime.setCompilerOptions(options.compilerOptions);
+            if (this.runtime.renderer && typeof options.hq === 'boolean') {
+                this.runtime.renderer.setUseHighQualityRender(options.hq);
+            }
+            if (typeof options.hq === 'boolean') this.runtime._storedHighQualityRender = options.hq;
+            if (Number(options.width) > 0 && Number(options.height) > 0) {
+                this.runtime.setStageSize(Number(options.width), Number(options.height));
+            }
+            this.runtime.storeProjectOptions();
+            const comment = this.runtime.findProjectOptionsComment();
+            const stage = this.runtime.getTargetForStage();
+            if (comment && stage && operation.commentId && comment.id !== operation.commentId &&
+                !stage.comments[operation.commentId]) {
+                delete stage.comments[comment.id];
+                comment.id = operation.commentId;
+                stage.comments[comment.id] = comment;
+            }
+            return;
+        }
+        if (operation.kind === 'extension.load' && typeof operation.source === 'string') {
+            await this.extensionManager.loadExtensionURL(operation.source, true);
+            return;
+        }
+        if (operation.kind === 'block') {
+            const target = this.runtime.getTargetById(operation.targetId);
+            if (!target?.blocks || !operation.event) return;
+            const event = {...operation.event};
+            if (typeof event.xml === 'string') event.xml = {outerHTML: event.xml};
+            if (event.newContents) event.newContents_ = event.newContents;
+            let newCoordinate = event.newCoordinateObject;
+            if (!newCoordinate && typeof event.newCoordinate === 'string') {
+                const parts = event.newCoordinate.split(',').map(Number);
+                if (parts.length === 2 && parts.every(Number.isFinite)) {
+                    newCoordinate = {x: parts[0], y: parts[1]};
+                }
+            }
+            if (newCoordinate) {
+                event.newCoordinate = newCoordinate;
+                event.newCoordinate_ = newCoordinate;
+            }
+            if (event.variableIsLocal) event.isLocal = true;
+            target.blocks.blocklyListen(event, target);
+            this.emit('collaborationWorkspaceOperation', operation);
+            return;
+        }
+
+        if (operation.kind === 'sprite.add') {
+            if (this.runtime.getTargetById(operation.targetId) || typeof operation.sprite !== 'string') return;
+            await this.addSprite(Base64Util.base64ToUint8Array(operation.sprite), {
+                selectTarget: false,
+                targetId: operation.targetId,
+                targetIndex: operation.targetIndex,
+                skipCollaboration: true
+            });
+            return;
+        }
+
+        const target = this.runtime.getTargetById(operation.targetId);
+        if (operation.kind === 'blocks.add' && target?.blocks && Array.isArray(operation.blocks)) {
+            const extensionIds = new Set(operation.extensions?.ids || []);
+            const extensionUrls = new Map(operation.extensions?.urls || []);
+            await this._loadExtensions(extensionIds, extensionUrls, true);
+            operation.blocks.forEach(block => target.blocks.createBlock(JSON.parse(JSON.stringify(block))));
+            target.blocks.updateTargetSpecificBlocks(target.isStage);
+            const topBlockIds = Array.isArray(operation.topBlockIds) ? operation.topBlockIds : [];
+            this.emit('collaborationWorkspaceBlocksAdded', {
+                targetId: target.id,
+                xml: topBlockIds.map(id => target.blocks.blockToXML(id, target.comments))
+                    .filter(Boolean)
+                    .join('')
+            });
+            return;
+        }
+        if ((operation.kind.startsWith('costume.') || operation.kind.startsWith('sound.')) &&
+            !target?.sprite) return;
+        if (operation.kind === 'costume.update') {
+            const current = target.getCostumes()[operation.costumeIndex];
+            if (!current) return;
+            const merged = await mergeCostumeUpdate(operation.baseCostume,
+                serializeCollaborationCostume(current), operation.costume, operation.canonicalCostume === true);
+            const loaded = await this._loadCollaborationCostume(merged);
+            const previousSkinId = current.skinId;
+            Object.keys(current).forEach(key => delete current[key]);
+            Object.assign(current, loaded);
+            if (target.currentCostume === operation.costumeIndex) target.setCostume(operation.costumeIndex);
+            if (previousSkinId !== current.skinId) this.runtime.renderer?.destroySkin?.(previousSkinId);
+            this.emitTargetsUpdate();
+            return serializeCollaborationCostume(current);
+        }
+        if (operation.kind === 'costume.add') {
+            const loaded = await this._loadCollaborationCostume(operation.costume);
+            const requestedIndex = Number(operation.costumeIndex);
+            const index = MathUtil.clamp(
+                Number.isFinite(requestedIndex) ? requestedIndex : target.getCostumes().length,
+                0,
+                target.getCostumes().length
+            );
+            target.addCostume(loaded, index);
+            this.emitTargetsUpdate();
+            return;
+        }
+        if (operation.kind === 'costume.rename') {
+            target.renameCostume(operation.costumeIndex, operation.name);
+            this.emitTargetsUpdate();
+            return;
+        }
+        if (operation.kind === 'costume.delete') {
+            target.deleteCostume(operation.costumeIndex);
+            this.emitTargetsUpdate();
+            return;
+        }
+        if (operation.kind === 'costume.reorder') {
+            target.reorderCostume(operation.costumeIndex, operation.newIndex);
+            this.emitTargetsUpdate();
+            return;
+        }
+        if (operation.kind === 'sound.update') {
+            const current = target.getSounds()[operation.soundIndex];
+            if (!current) return;
+            const loaded = await this._loadCollaborationSound(target, operation.sound);
+            const soundBank = target.sprite.soundBank;
+            if (current.soundId && current.soundId !== loaded.soundId) {
+                soundBank.soundPlayers[current.soundId]?.stop?.();
+                delete soundBank.soundPlayers[current.soundId];
+                soundBank.playerTargets?.delete(current.soundId);
+                soundBank.soundEffects?.delete(current.soundId);
+            }
+            target.sprite.sounds[operation.soundIndex] = loaded;
+            this.emitTargetsUpdate();
+            return;
+        }
+        if (operation.kind === 'sound.add') {
+            const loaded = await this._loadCollaborationSound(target, operation.sound);
+            const requestedIndex = Number(operation.soundIndex);
+            const index = MathUtil.clamp(
+                Number.isFinite(requestedIndex) ? requestedIndex : target.getSounds().length,
+                0,
+                target.getSounds().length
+            );
+            target.addSound(loaded, index);
+            this.emitTargetsUpdate();
+            return;
+        }
+        if (operation.kind === 'sound.rename') {
+            target.renameSound(operation.soundIndex, operation.name);
+            this.emitTargetsUpdate();
+            return;
+        }
+        if (operation.kind === 'sound.delete') {
+            target.deleteSound(operation.soundIndex);
+            this.emitTargetsUpdate();
+            return;
+        }
+        if (operation.kind === 'sound.reorder') {
+            target.reorderSound(operation.soundIndex, operation.newIndex);
+            this.emitTargetsUpdate();
+            return;
+        }
+        if (operation.kind === 'target.reorder' && target) {
+            this.reorderTarget(this.runtime.targets.indexOf(target), operation.newIndex, true);
+            return;
+        }
+        if (operation.kind === 'sprite.rename') {
+            if (target) this.renameSprite(target.id, operation.name, true);
+            return;
+        }
+        if (operation.kind === 'sprite.info') {
+            if (target) {
+                target.postSpriteInfo(operation.data || {});
+                this.emitTargetsUpdate();
+            }
+            return;
+        }
+        if (operation.kind === 'sprite.delete' && target) {
+            this.deleteSprite(operation.targetId, {skipCollaboration: true, createRestore: false});
+        }
+    }
+
+    /**
      * @param {JSZip.OutputType} [type] JSZip output type. Defaults to 'arraybuffer'.
      * @returns {StreamHelper} JSZip StreamHelper object generating the compressed sb3.
      * See: https://stuk.github.io/jszip/documentation/api_streamhelper.html
@@ -767,8 +1291,9 @@ class VirtualMachine extends EventEmitter {
     /**
      * @param {string[]} extensionIDs The IDs of the extensions
      * @param {Map<string, string>} extensionURLs A map of extension ID to URL
+     * @param {boolean} skipCollaboration Do not emit operations for received loads
      */
-    async _loadExtensions (extensionIDs, extensionURLs = new Map()) {
+    async _loadExtensions (extensionIDs, extensionURLs = new Map(), skipCollaboration = false) {
         const defaultExtensionURLs = require('./extension-support/tw-default-extension-urls');
         const extensionPromises = [];
         for (const extensionID of extensionIDs) {
@@ -776,7 +1301,7 @@ class VirtualMachine extends EventEmitter {
                 // Already loaded
             } else if (this.extensionManager.isBuiltinExtension(extensionID)) {
                 // Builtin extension
-                this.extensionManager.loadExtensionIdSync(extensionID);
+                this.extensionManager.loadExtensionIdSync(extensionID, skipCollaboration);
             } else {
                 // Custom extension
                 let url = extensionURLs.get(extensionID);
@@ -787,7 +1312,7 @@ class VirtualMachine extends EventEmitter {
                     throw new Error(`Unknown extension: ${extensionID}`);
                 }
                 if (await this.securityManager.canLoadExtensionFromProject(url)) {
-                    extensionPromises.push(this.extensionManager.loadExtensionURL(url));
+                    extensionPromises.push(this.extensionManager.loadExtensionURL(url, skipCollaboration));
                 } else {
                     throw new Error(`Permission to load extension denied: ${extensionID}`);
                 }
@@ -801,19 +1326,30 @@ class VirtualMachine extends EventEmitter {
      * @param {Array.<Target>} targets - the targets to be installed
      * @param {ImportedExtensionsInfo} extensions - metadata about extensions used by these targets
      * @param {boolean} wholeProject - set to true if installing a whole project, as opposed to a single sprite.
+     * @param {object} options install behavior for a single sprite
      * @returns {Promise} resolved once targets have been installed
      */
-    async installTargets (targets, extensions, wholeProject) {
+    async installTargets (targets, extensions, wholeProject, options = {}) {
         await this.extensionManager.allAsyncExtensionsLoaded();
 
         targets = targets.filter(target => !!target);
+        const previousEditingTarget = this.editingTarget;
+        if (!wholeProject && targets.length === 1 && options.targetId) {
+            targets[0].id = options.targetId;
+        }
 
-        return this._loadExtensions(extensions.extensionIDs, extensions.extensionURLs).then(() => {
+        return this._loadExtensions(
+            extensions.extensionIDs,
+            extensions.extensionURLs,
+            options.skipCollaboration === true
+        ).then(() => {
             targets.forEach(target => {
                 this.runtime.addTarget(target);
                 (/** @type RenderedTarget */ target).updateAllDrawableProperties();
                 // Ensure unique sprite name
-                if (target.isSprite()) this.renameSprite(target.id, target.getName());
+                if (target.isSprite()) {
+                    this.renameSprite(target.id, target.getName(), options.skipCollaboration === true);
+                }
             });
             // Sort the executable targets by layerOrder.
             // Remove layerOrder property after use.
@@ -822,15 +1358,16 @@ class VirtualMachine extends EventEmitter {
                 delete target.layerOrder;
             });
 
-            // Select the first target for editing, e.g., the first sprite.
-            if (wholeProject && (targets.length > 1)) {
-                this.editingTarget = targets[1];
-            } else {
-                this.editingTarget = targets[0];
+            const installedTarget = targets[0];
+            const selectTarget = wholeProject || options.selectTarget !== false;
+            if (selectTarget) {
+                this.editingTarget = wholeProject && (targets.length > 1) ? targets[1] : installedTarget;
+            } else if (previousEditingTarget && this.runtime.getTargetById(previousEditingTarget.id)) {
+                this.editingTarget = previousEditingTarget;
             }
 
             if (!wholeProject) {
-                this.editingTarget.fixUpVariableReferences();
+                installedTarget.fixUpVariableReferences();
             }
 
             if (wholeProject) {
@@ -838,10 +1375,19 @@ class VirtualMachine extends EventEmitter {
             }
 
             // Update the VM user's knowledge of targets and blocks on the workspace.
+            if (!wholeProject && Number.isFinite(Number(options.targetIndex))) {
+                const currentIndex = this.runtime.targets.indexOf(installedTarget);
+                const newIndex = MathUtil.clamp(Number(options.targetIndex), 0, this.runtime.targets.length - 1);
+                if (currentIndex !== newIndex) {
+                    this.runtime.targets.splice(currentIndex, 1);
+                    this.runtime.targets.splice(newIndex, 0, installedTarget);
+                }
+            }
             this.emitTargetsUpdate(false /* Don't emit project change */);
-            this.emitWorkspaceUpdate();
+            if (selectTarget) this.emitWorkspaceUpdate();
             this.runtime.setEditingTarget(this.editingTarget);
             this.runtime.ioDevices.cloud.setStage(this.runtime.getTargetForStage());
+            return targets;
         });
     }
 
@@ -849,9 +1395,10 @@ class VirtualMachine extends EventEmitter {
      * Add a sprite, this could be .sprite2 or .sprite3. Unpack and validate
      * such a file first.
      * @param {string | object} input A json string, object, or ArrayBuffer representing the project to load.
+     * @param {object} options collaboration-safe install behavior
      * @return {!Promise} Promise that resolves after targets are installed.
      */
-    addSprite (input) {
+    addSprite (input, options = {}) {
         const errorPrefix = 'Sprite Upload Error:';
         if (typeof input === 'object' && !(input instanceof ArrayBuffer) &&
           !ArrayBuffer.isView(input)) {
@@ -879,16 +1426,21 @@ class VirtualMachine extends EventEmitter {
             .then(validatedInput => {
                 const projectVersion = validatedInput[0].projectVersion;
                 if (projectVersion === 2) {
-                    return this._addSprite2(validatedInput[0], validatedInput[1]);
+                    return this._addSprite2(validatedInput[0], validatedInput[1], options);
                 }
                 if (projectVersion === 3) {
-                    return this._addSprite3(validatedInput[0], validatedInput[1]);
+                    return this._addSprite3(validatedInput[0], validatedInput[1], options);
                 }
                 // TODO: reject with an Error (possible breaking API change!)
                 // eslint-disable-next-line prefer-promise-reject-errors
                 return Promise.reject(`${errorPrefix} Unable to verify sprite version.`);
             })
-            .then(() => this.runtime.emitProjectChanged())
+            .then(async targets => {
+                this.runtime.emitProjectChanged();
+                const target = targets?.[0];
+                if (!options.skipCollaboration) await this._emitSpriteAdd(target);
+                return target;
+            })
             .catch(error => {
                 // Intentionally rejecting here (want errors to be handled by caller)
                 if (Object.prototype.hasOwnProperty.call(error, 'validationError')) {
@@ -904,29 +1456,31 @@ class VirtualMachine extends EventEmitter {
      * Add a single sprite from the "Sprite2" (i.e., SB2 sprite) format.
      * @param {object} sprite Object representing 2.0 sprite to be added.
      * @param {?ArrayBuffer} zip Optional zip of assets being referenced by json
+     * @param {object} options collaboration-safe install behavior
      * @returns {Promise} Promise that resolves after the sprite is added
      */
-    _addSprite2 (sprite, zip) {
+    _addSprite2 (sprite, zip, options) {
         // Validate & parse
 
         const sb2 = require('./serialization/sb2');
         return sb2.deserialize(sprite, this.runtime, true, zip)
             .then(({targets, extensions}) =>
-                this.installTargets(targets, extensions, false));
+                this.installTargets(targets, extensions, false, options));
     }
 
     /**
      * Add a single sb3 sprite.
      * @param {object} sprite Object rperesenting 3.0 sprite to be added.
      * @param {?ArrayBuffer} zip Optional zip of assets being referenced by target json
+     * @param {object} options collaboration-safe install behavior
      * @returns {Promise} Promise that resolves after the sprite is added
      */
-    _addSprite3 (sprite, zip) {
+    _addSprite3 (sprite, zip, options) {
         // Validate & parse
         const sb3 = require('./serialization/sb3');
         return sb3
             .deserialize(sprite, this.runtime, zip, true)
-            .then(({targets, extensions}) => this.installTargets(targets, extensions, false));
+            .then(({targets, extensions}) => this.installTargets(targets, extensions, false, options));
     }
 
     /**
@@ -947,10 +1501,17 @@ class VirtualMachine extends EventEmitter {
         if (target) {
             return loadCostume(md5ext, costumeObject, this.runtime, optVersion).then(() => {
                 target.addCostume(costumeObject);
-                target.setCostume(
-                    target.getCostumes().length - 1
-                );
+                const costumeIndex = target.getCostumes().length - 1;
+                target.setCostume(costumeIndex);
                 this.runtime.emitProjectChanged();
+                const costume = serializeCollaborationCostume(costumeObject);
+                if (costume) {
+                    this._emitCollaborationOperation('costume.add', {
+                        targetId: target.id,
+                        costumeIndex,
+                        costume
+                    });
+                }
             });
         }
         // If the target cannot be found by id, return a rejected promise
@@ -982,13 +1543,22 @@ class VirtualMachine extends EventEmitter {
      * @returns {?Promise} - a promise that resolves when the costume has been decoded and added
      */
     duplicateCostume (costumeIndex) {
-        const originalCostume = this.editingTarget.getCostumes()[costumeIndex];
+        const target = this.editingTarget;
+        const originalCostume = target.getCostumes()[costumeIndex];
         const clone = Object.assign({}, originalCostume);
         const md5ext = `${clone.assetId}.${clone.dataFormat}`;
         return loadCostume(md5ext, clone, this.runtime).then(() => {
-            this.editingTarget.addCostume(clone, costumeIndex + 1);
-            this.editingTarget.setCostume(costumeIndex + 1);
+            target.addCostume(clone, costumeIndex + 1);
+            target.setCostume(costumeIndex + 1);
             this.emitTargetsUpdate();
+            const costume = serializeCollaborationCostume(clone);
+            if (costume) {
+                this._emitCollaborationOperation('costume.add', {
+                    targetId: target.id,
+                    costumeIndex: costumeIndex + 1,
+                    costume
+                });
+            }
         });
     }
 
@@ -998,11 +1568,20 @@ class VirtualMachine extends EventEmitter {
      * @returns {?Promise} - a promise that resolves when the sound has been decoded and added
      */
     duplicateSound (soundIndex) {
-        const originalSound = this.editingTarget.getSounds()[soundIndex];
+        const target = this.editingTarget;
+        const originalSound = target.getSounds()[soundIndex];
         const clone = Object.assign({}, originalSound);
-        return loadSound(clone, this.runtime, this.editingTarget.sprite.soundBank).then(() => {
-            this.editingTarget.addSound(clone, soundIndex + 1);
+        return loadSound(clone, this.runtime, target.sprite.soundBank).then(() => {
+            target.addSound(clone, soundIndex + 1);
             this.emitTargetsUpdate();
+            const sound = serializeCollaborationSound(clone);
+            if (sound) {
+                this._emitCollaborationOperation('sound.add', {
+                    targetId: target.id,
+                    soundIndex: soundIndex + 1,
+                    sound
+                });
+            }
         });
     }
 
@@ -1012,8 +1591,17 @@ class VirtualMachine extends EventEmitter {
      * @param {string} newName - the desired new name of the costume (will be modified if already in use).
      */
     renameCostume (costumeIndex, newName) {
-        this.editingTarget.renameCostume(costumeIndex, newName);
+        const target = this.editingTarget;
+        target.renameCostume(costumeIndex, newName);
         this.emitTargetsUpdate();
+        const costume = target.getCostumes()[costumeIndex];
+        if (costume) {
+            this._emitCollaborationOperation('costume.rename', {
+                targetId: target.id,
+                costumeIndex,
+                name: costume.name
+            });
+        }
     }
 
     /**
@@ -1027,9 +1615,21 @@ class VirtualMachine extends EventEmitter {
         if (deletedCostume) {
             const target = this.editingTarget;
             this.runtime.emitProjectChanged();
+            this._emitCollaborationOperation('costume.delete', {
+                targetId: target.id,
+                costumeIndex
+            });
             return () => {
-                target.addCostume(deletedCostume);
+                target.addCostume(deletedCostume, costumeIndex);
                 this.emitTargetsUpdate();
+                const costume = serializeCollaborationCostume(deletedCostume);
+                if (costume) {
+                    this._emitCollaborationOperation('costume.add', {
+                        targetId: target.id,
+                        costumeIndex,
+                        costume
+                    });
+                }
             };
         }
         return null;
@@ -1047,7 +1647,16 @@ class VirtualMachine extends EventEmitter {
         if (target) {
             return loadSound(soundObject, this.runtime, target.sprite.soundBank).then(() => {
                 target.addSound(soundObject);
+                const soundIndex = target.getSounds().length - 1;
                 this.emitTargetsUpdate();
+                const sound = serializeCollaborationSound(soundObject);
+                if (sound) {
+                    this._emitCollaborationOperation('sound.add', {
+                        targetId: target.id,
+                        soundIndex,
+                        sound
+                    });
+                }
             });
         }
         // If the target cannot be found by id, return a rejected promise
@@ -1060,8 +1669,17 @@ class VirtualMachine extends EventEmitter {
      * @param {string} newName - the desired new name of the sound (will be modified if already in use).
      */
     renameSound (soundIndex, newName) {
-        this.editingTarget.renameSound(soundIndex, newName);
+        const target = this.editingTarget;
+        target.renameSound(soundIndex, newName);
         this.emitTargetsUpdate();
+        const sound = target.getSounds()[soundIndex];
+        if (sound) {
+            this._emitCollaborationOperation('sound.rename', {
+                targetId: target.id,
+                soundIndex,
+                name: sound.name
+            });
+        }
     }
 
     /**
@@ -1117,6 +1735,7 @@ class VirtualMachine extends EventEmitter {
         // case, and gui should have logged an error.
 
         this.emitTargetsUpdate();
+        if (soundEncoding && sound) this._emitSoundUpdate(sound);
     }
 
     /**
@@ -1130,9 +1749,21 @@ class VirtualMachine extends EventEmitter {
         const deletedSound = this.editingTarget.deleteSound(soundIndex);
         if (deletedSound) {
             this.runtime.emitProjectChanged();
+            this._emitCollaborationOperation('sound.delete', {
+                targetId: target.id,
+                soundIndex
+            });
             const restoreFun = () => {
-                target.addSound(deletedSound);
+                target.addSound(deletedSound, soundIndex);
                 this.emitTargetsUpdate();
+                const sound = serializeCollaborationSound(deletedSound);
+                if (sound) {
+                    this._emitCollaborationOperation('sound.add', {
+                        targetId: target.id,
+                        soundIndex,
+                        sound
+                    });
+                }
             };
             return restoreFun;
         }
@@ -1187,22 +1818,22 @@ class VirtualMachine extends EventEmitter {
      * @param {!number} bitmapResolution 1 for bitmaps that have 1 pixel per unit of stage,
      *     2 for double-resolution bitmaps
      */
-    updateBitmap (costumeIndex, bitmap, rotationCenterX, rotationCenterY, bitmapResolution) {
+    updateBitmap (costumeIndex, bitmap, rotationCenterX, rotationCenterY, bitmapResolution, editBase) {
         return this._updateBitmap(
             this.editingTarget.getCostumes()[costumeIndex],
             bitmap,
             rotationCenterX,
             rotationCenterY,
-            bitmapResolution
+            bitmapResolution, editBase
         );
     }
 
-    _updateBitmap (costume, bitmap, rotationCenterX, rotationCenterY, bitmapResolution) {
+    _updateBitmap (costume, bitmap, rotationCenterX, rotationCenterY, bitmapResolution, editBase) {
         if (!(costume && this.runtime && this.runtime.renderer)) return;
         if (costume && costume.broken) delete costume.broken;
 
-        costume.rotationCenterX = rotationCenterX;
-        costume.rotationCenterY = rotationCenterY;
+        const base = this.listenerCount('collaborationOperation') || editBase ?
+            paintEditBase(serializeCollaborationCostume(costume), editBase) : null;
 
         // If the bitmap originally had a zero width or height, use that value
         const bitmapWidth = bitmap.sourceWidth === 0 ? 0 : bitmap.width;
@@ -1226,8 +1857,35 @@ class VirtualMachine extends EventEmitter {
         // @todo there should be a better way to get from ImageData to a decodable storage format
         canvas.toBlob(blob => {
             const reader = new FileReader();
-            reader.addEventListener('loadend', () => {
+            reader.addEventListener('loadend', async () => {
                 const storage = this.runtime.storage;
+                if (editBase && base) {
+                    const current = serializeCollaborationCostume(costume);
+                    const incoming = {...current,
+                        rotationCenterX,
+                        rotationCenterY,
+                        bitmapResolution,
+                        dataFormat: 'png',
+                        size: [bitmapWidth, bitmapHeight],
+                        assetData: {assetId: null,
+                            dataFormat: 'png',
+                            data: Base64Util.uint8ArrayToBase64(new Uint8Array(reader.result))}};
+                    const merged = await mergeCostumeUpdate(base, current, incoming);
+                    const loaded = await this._loadCollaborationCostume(merged);
+                    const skinId = costume.skinId;
+                    Object.keys(costume).forEach(key => delete costume[key]);
+                    Object.assign(costume, loaded);
+                    const owner = this._findCostumeOwner(costume);
+                    if (owner && owner.target.currentCostume === owner.costumeIndex) {
+                        owner.target.setCostume(owner.costumeIndex);
+                    }
+                    if (skinId !== loaded.skinId) this.runtime.renderer?.destroySkin?.(skinId);
+                    this.emitTargetsUpdate();
+                    this._emitCostumeUpdate(costume, base);
+                    return;
+                }
+                costume.rotationCenterX = rotationCenterX;
+                costume.rotationCenterY = rotationCenterY;
                 costume.dataFormat = storage.DataFormat.PNG;
                 costume.bitmapResolution = bitmapResolution;
                 costume.size = [bitmapWidth, bitmapHeight];
@@ -1241,6 +1899,7 @@ class VirtualMachine extends EventEmitter {
                 costume.assetId = costume.asset.assetId;
                 costume.md5 = `${costume.assetId}.${costume.dataFormat}`;
                 this.emitTargetsUpdate();
+                this._emitCostumeUpdate(costume, base);
             });
             // Bitmaps with a zero width or height return null for their blob
             if (blob){
@@ -1256,16 +1915,31 @@ class VirtualMachine extends EventEmitter {
      * @param {number} rotationCenterX x of point about which the costume rotates, relative to its upper left corner
      * @param {number} rotationCenterY y of point about which the costume rotates, relative to its upper left corner
      */
-    updateSvg (costumeIndex, svg, rotationCenterX, rotationCenterY) {
+    updateSvg (costumeIndex, svg, rotationCenterX, rotationCenterY, editBase) {
         return this._updateSvg(
             this.editingTarget.getCostumes()[costumeIndex],
             svg,
             rotationCenterX,
-            rotationCenterY
+            rotationCenterY, editBase
         );
     }
 
-    _updateSvg (costume, svg, rotationCenterX, rotationCenterY) {
+    _updateSvg (costume, svg, rotationCenterX, rotationCenterY, editBase) {
+        const current = this.listenerCount('collaborationOperation') || editBase ?
+            serializeCollaborationCostume(costume) : null;
+        const base = paintEditBase(current, editBase);
+        if (editBase && base?.assetData?.dataFormat === 'svg' && current?.assetData?.dataFormat === 'svg') {
+            const incoming = {...current,
+                rotationCenterX,
+                rotationCenterY,
+                assetData: {dataFormat: 'svg',
+                    assetId: null,
+                    data: Base64Util.uint8ArrayToBase64(new _TextEncoder().encode(svg))}};
+            const merged = mergeVectorCostumes(base, current, incoming);
+            svg = new TextDecoder().decode(Base64Util.base64ToUint8Array(merged.assetData.data));
+            rotationCenterX = merged.rotationCenterX;
+            rotationCenterY = merged.rotationCenterY;
+        }
         if (costume && costume.broken) delete costume.broken;
         if (costume && this.runtime && this.runtime.renderer) {
             costume.rotationCenterX = rotationCenterX;
@@ -1288,6 +1962,7 @@ class VirtualMachine extends EventEmitter {
         costume.assetId = costume.asset.assetId;
         costume.md5 = `${costume.assetId}.${costume.dataFormat}`;
         this.emitTargetsUpdate();
+        this._emitCostumeUpdate(costume, base);
     }
 
     /**
@@ -1301,20 +1976,17 @@ class VirtualMachine extends EventEmitter {
      * @returns {?Promise} - a promise that resolves when the backdrop has been added
      */
     addBackdrop (md5ext, backdropObject) {
-        return loadCostume(md5ext, backdropObject, this.runtime).then(() => {
-            const stage = this.runtime.getTargetForStage();
-            stage.addCostume(backdropObject);
-            stage.setCostume(stage.getCostumes().length - 1);
-            this.runtime.emitProjectChanged();
-        });
+        const stage = this.runtime.getTargetForStage();
+        return this.addCostume(md5ext, backdropObject, stage.id);
     }
 
     /**
      * Rename a sprite.
      * @param {string} targetId ID of a target whose sprite to rename.
      * @param {string} newName New name of the sprite.
+     * @param {boolean} skipCollaboration Do not emit an operation for a received rename.
      */
-    renameSprite (targetId, newName) {
+    renameSprite (targetId, newName, skipCollaboration = false) {
         const target = this.runtime.getTargetById(targetId);
         if (target) {
             if (!target.isSprite()) {
@@ -1341,6 +2013,12 @@ class VirtualMachine extends EventEmitter {
                 }
 
                 if (newUnusedName !== oldName) this.emitTargetsUpdate();
+                if (!skipCollaboration) {
+                    this._emitCollaborationOperation('sprite.rename', {
+                        targetId,
+                        name: newUnusedName
+                    });
+                }
             }
         } else {
             throw new Error('No target with the provided id.');
@@ -1350,9 +2028,10 @@ class VirtualMachine extends EventEmitter {
     /**
      * Delete a sprite and all its clones.
      * @param {string} targetId ID of a target whose sprite to delete.
-     * @return {Function} Returns a function to restore the sprite that was deleted
+     * @param {object} options collaboration and restore behavior
+     * @return {?Function} Returns a function to restore the sprite that was deleted
      */
-    deleteSprite (targetId) {
+    deleteSprite (targetId, options = {}) {
         const target = this.runtime.getTargetById(targetId);
 
         if (target) {
@@ -1364,8 +2043,9 @@ class VirtualMachine extends EventEmitter {
             if (!sprite) {
                 throw new Error('No sprite associated with this target.');
             }
-            const spritePromise = this.exportSprite(targetId, 'uint8array');
-            const restoreSprite = () => spritePromise.then(spriteBuffer => this.addSprite(spriteBuffer));
+            const spritePromise = options.createRestore === false ? null : this.exportSprite(targetId, 'uint8array');
+            const restoreSprite = spritePromise ?
+                () => spritePromise.then(spriteBuffer => this.addSprite(spriteBuffer)) : null;
             // Remove monitors from the runtime state and remove the
             // target-specific monitored blocks (e.g. local variables)
             target.deleteMonitors();
@@ -1386,6 +2066,7 @@ class VirtualMachine extends EventEmitter {
             }
             // Sprite object should be deleted by GC.
             this.emitTargetsUpdate();
+            if (!options.skipCollaboration) this._emitCollaborationOperation('sprite.delete', {targetId});
             return restoreSprite;
         }
 
@@ -1407,10 +2088,13 @@ class VirtualMachine extends EventEmitter {
         } else if (!target.sprite) {
             throw new Error('No sprite associated with this target.');
         }
-        return target.duplicate().then(newTarget => {
+        return target.duplicate().then(async newTarget => {
             this.runtime.addTarget(newTarget);
             newTarget.goBehindOther(target);
             this.setEditingTarget(newTarget.id);
+            this.runtime.emitProjectChanged();
+            await this._emitSpriteAdd(newTarget);
+            return newTarget;
         });
     }
 
@@ -1487,7 +2171,20 @@ class VirtualMachine extends EventEmitter {
      */
     blockListener (e) {
         if (this.editingTarget) {
+            if (e?.element === 'stackclick' && this._collaborationRuntimeHandler?.({
+                command: 'stack_click',
+                targetId: this.editingTarget.id,
+                blockId: e.blockId
+            })) return;
+            const collaborationEvent = serializeCollaborationBlockEvent(e, this.editingTarget);
+            const targetId = this.editingTarget.id;
             this.editingTarget.blocks.blocklyListen(e);
+            if (collaborationEvent) {
+                this._emitCollaborationOperation('block', {
+                    targetId,
+                    event: collaborationEvent
+                });
+            }
         }
     }
 
@@ -1496,6 +2193,13 @@ class VirtualMachine extends EventEmitter {
      * @param {!Blockly.Event} e Any Blockly event.
      */
     flyoutBlockListener (e) {
+        if (e?.element === 'stackclick' && this._collaborationRuntimeHandler?.({
+            command: 'stack_click',
+            targetId: this.editingTarget?.id || null,
+            blockId: e.blockId,
+            flyoutBlocks: this._serializeCollaborationBlockTree(this.runtime.flyoutBlocks, e.blockId)
+        })) return;
+        if (this._forwardCollaborationMonitorEvent(e)) return;
         this.runtime.flyoutBlocks.blocklyListen(e);
     }
 
@@ -1504,6 +2208,7 @@ class VirtualMachine extends EventEmitter {
      * @param {!Blockly.Event} e Any Blockly event.
      */
     monitorBlockListener (e) {
+        if (this._forwardCollaborationMonitorEvent(e)) return;
         // Filter events by type, since monitor blocks only need to listen to these events.
         // Monitor blocks shouldn't be destroyed when flyout blocks are deleted.
         if (['create', 'change'].indexOf(e.type) !== -1) {
@@ -1543,6 +2248,7 @@ class VirtualMachine extends EventEmitter {
         if (this.editingTarget && targetId === this.editingTarget.id) {
             return;
         }
+        this.flushBlocklyEvents?.();
         const target = this.runtime.getTargetById(targetId);
         if (target) {
             this.editingTarget = target;
@@ -1598,6 +2304,15 @@ class VirtualMachine extends EventEmitter {
                 target.blocks.createBlock(block);
             });
             target.blocks.updateTargetSpecificBlocks(target.isStage);
+            this._emitCollaborationOperation('blocks.add', {
+                targetId,
+                blocks: JSON.parse(JSON.stringify(copiedBlocks)),
+                topBlockIds: copiedBlocks.filter(block => block.topLevel).map(block => block.id),
+                extensions: {
+                    ids: [...extensionIDs],
+                    urls: [...extensionURLs]
+                }
+            });
         });
     }
 
@@ -1616,9 +2331,17 @@ class VirtualMachine extends EventEmitter {
             const target = this.runtime.getTargetById(targetId);
             if (target) {
                 target.addCostume(clone);
-                target.setCostume(
-                    target.getCostumes().length - 1
-                );
+                const addedIndex = target.getCostumes().length - 1;
+                target.setCostume(addedIndex);
+                this.emitTargetsUpdate();
+                const costume = serializeCollaborationCostume(clone);
+                if (costume) {
+                    this._emitCollaborationOperation('costume.add', {
+                        targetId: target.id,
+                        costumeIndex: addedIndex,
+                        costume
+                    });
+                }
             }
         });
     }
@@ -1636,7 +2359,16 @@ class VirtualMachine extends EventEmitter {
         return loadSound(clone, this.runtime, target.sprite.soundBank).then(() => {
             if (target) {
                 target.addSound(clone);
+                const addedIndex = target.getSounds().length - 1;
                 this.emitTargetsUpdate();
+                const sound = serializeCollaborationSound(clone);
+                if (sound) {
+                    this._emitCollaborationOperation('sound.add', {
+                        targetId: target.id,
+                        soundIndex: addedIndex,
+                        sound
+                    });
+                }
             }
         });
     }
@@ -1694,35 +2426,6 @@ class VirtualMachine extends EventEmitter {
      * of the current editing target's blocks.
      */
     emitWorkspaceUpdate () {
-        // Create a list of broadcast message Ids according to the stage variables
-        const stageVariables = this.runtime.getTargetForStage().variables;
-        let messageIds = [];
-        for (const varId in stageVariables) {
-            if (stageVariables[varId].type === Variable.BROADCAST_MESSAGE_TYPE) {
-                messageIds.push(varId);
-            }
-        }
-        // Go through all blocks on all targets, removing referenced
-        // broadcast ids from the list.
-        for (let i = 0; i < this.runtime.targets.length; i++) {
-            const currTarget = this.runtime.targets[i];
-            const currBlocks = currTarget.blocks._blocks;
-            for (const blockId in currBlocks) {
-                if (currBlocks[blockId].fields.BROADCAST_OPTION) {
-                    const id = currBlocks[blockId].fields.BROADCAST_OPTION.id;
-                    const index = messageIds.indexOf(id);
-                    if (index !== -1) {
-                        messageIds = messageIds.slice(0, index)
-                            .concat(messageIds.slice(index + 1));
-                    }
-                }
-            }
-        }
-        // Anything left in messageIds is not referenced by a block, so delete it.
-        for (let i = 0; i < messageIds.length; i++) {
-            const id = messageIds[i];
-            delete this.runtime.getTargetForStage().variables[id];
-        }
         const globalVarMap = Object.assign({}, this.runtime.getTargetForStage().variables);
         const localVarMap = this.editingTarget.isStage ?
             Object.create(null) :
@@ -1766,9 +2469,10 @@ class VirtualMachine extends EventEmitter {
      * Reorder target by index. Return whether a change was made.
      * @param {!string} targetIndex Index of the target.
      * @param {!number} newIndex index that the target should be moved to.
+     * @param {boolean} skipCollaboration Do not emit an operation for a received reorder.
      * @returns {boolean} Whether a target was reordered.
      */
-    reorderTarget (targetIndex, newIndex) {
+    reorderTarget (targetIndex, newIndex, skipCollaboration = false) {
         let targets = this.runtime.targets;
         targetIndex = MathUtil.clamp(targetIndex, 0, targets.length - 1);
         newIndex = MathUtil.clamp(newIndex, 0, targets.length - 1);
@@ -1778,6 +2482,12 @@ class VirtualMachine extends EventEmitter {
         targets.splice(newIndex, 0, target);
         this.runtime.targets = targets;
         this.emitTargetsUpdate();
+        if (!skipCollaboration) {
+            this._emitCollaborationOperation('target.reorder', {
+                targetId: target.id,
+                newIndex
+            });
+        }
         return true;
     }
 
@@ -1794,6 +2504,11 @@ class VirtualMachine extends EventEmitter {
             const reorderSuccessful = target.reorderCostume(costumeIndex, newIndex);
             if (reorderSuccessful) {
                 this.runtime.emitProjectChanged();
+                this._emitCollaborationOperation('costume.reorder', {
+                    targetId,
+                    costumeIndex,
+                    newIndex
+                });
             }
             return reorderSuccessful;
         }
@@ -1813,6 +2528,11 @@ class VirtualMachine extends EventEmitter {
             const reorderSuccessful = target.reorderSound(soundIndex, newIndex);
             if (reorderSuccessful) {
                 this.runtime.emitProjectChanged();
+                this._emitCollaborationOperation('sound.reorder', {
+                    targetId,
+                    soundIndex,
+                    newIndex
+                });
             }
             return reorderSuccessful;
         }
@@ -1851,6 +2571,7 @@ class VirtualMachine extends EventEmitter {
      * @param {object} data An object with sprite info data to set.
      */
     postSpriteInfo (data) {
+        const target = this._dragTarget || this.editingTarget;
         if (this._dragTarget) {
             this._dragTarget.postSpriteInfo(data);
         } else {
@@ -1861,6 +2582,12 @@ class VirtualMachine extends EventEmitter {
         // through dragging a sprite on the stage
         // Emit a project changed event.
         this.runtime.emitProjectChanged();
+        if (target) {
+            this._emitCollaborationOperation('sprite.info', {
+                targetId: target.id,
+                data: JSON.parse(JSON.stringify(data || {}))
+            });
+        }
     }
 
     /**
@@ -1871,11 +2598,18 @@ class VirtualMachine extends EventEmitter {
      * @returns {boolean} whether the target and variable were found and updated.
      */
     setVariableValue (targetId, variableId, value) {
+        if (this._collaborationRuntimeHandler?.({
+            command: 'variable_set',
+            targetId,
+            variableId,
+            value: Array.isArray(value) ? value.slice() : value
+        })) return true;
         const target = this.runtime.getTargetById(targetId);
         if (target) {
             const variable = target.lookupVariableById(variableId);
             if (variable) {
                 variable.value = value;
+                if (Array.isArray(value)) variable._monitorUpToDate = false;
 
                 if (variable.isCloud) {
                     this.runtime.ioDevices.cloud.requestUpdateVariable(variable.name, variable.value);
@@ -1885,6 +2619,23 @@ class VirtualMachine extends EventEmitter {
             }
         }
         return false;
+    }
+
+    /**
+     * Update a stage monitor, forwarding editor changes to the host when this
+     * VM is a collaboration guest.
+     * @param {import('./engine/monitor-record').ExternalDelta} delta monitor fields to update
+     * @returns {boolean} whether the update was accepted
+     */
+    updateMonitor (delta) {
+        const source = MonitorRecord.externalDeltaToJS(delta);
+        if (!source || typeof source !== 'object') return false;
+        const monitorDelta = Object.assign({}, source);
+        if (this._collaborationRuntimeHandler?.({
+            command: 'monitor_update',
+            delta: monitorDelta
+        })) return true;
+        return this.runtime.requestUpdateMonitor(monitorDelta);
     }
 
     /**

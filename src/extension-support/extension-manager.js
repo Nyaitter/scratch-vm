@@ -157,8 +157,9 @@ class ExtensionManager {
      * Synchronously load an internal extension (core or non-core) by ID. This call will
      * fail if the provided id is not does not match an internal extension.
      * @param {string} extensionId - the ID of an internal extension
+     * @param {boolean} skipCollaboration Do not emit an operation for a received load
      */
-    loadExtensionIdSync (extensionId) {
+    loadExtensionIdSync (extensionId, skipCollaboration = false) {
         if (!this.isBuiltinExtension(extensionId)) {
             log.warn(`Could not find extension ${extensionId} in the built in extensions.`);
             return;
@@ -176,6 +177,7 @@ class ExtensionManager {
         const serviceName = this._registerInternalExtension(extensionInstance);
         this._loadedExtensions.set(extensionId, serviceName);
         this.runtime.compilerRegisterExtension(extensionId, extensionInstance);
+        if (!skipCollaboration) this.vm._emitCollaborationOperation?.('extension.load', {source: extensionId});
     }
 
     addBuiltinExtension (extensionId, extensionClass) {
@@ -199,11 +201,37 @@ class ExtensionManager {
     /**
      * Load an extension by URL or internal extension ID
      * @param {string} extensionURL - the URL for the extension to load OR the ID of an internal extension
+     * @param {boolean} skipCollaboration Do not emit an operation for a received load
      * @returns {Promise} resolved once the extension is loaded and initialized or rejected on failure
      */
-    async loadExtensionURL (extensionURL) {
+    readNditorHost (request) {
+        if (request?.kind === 'extension') {
+            if (this.runtime._nditorCollaborationRole === 'guest' && this.vm._nditorHostRead) {
+                return this.vm._nditorHostRead(request);
+            }
+            const category = this.runtime._blockInfo.find(info => info.blocks.some(block =>
+                block.json?.type === request.opcode));
+            if (!category || !this._loadedExtensions.has(category.id) || this.isBuiltinExtension(category.id)) {
+                return Promise.reject(new Error('Unknown custom extension block'));
+            }
+            const primitive = this.runtime.getOpcodeFunction(request.opcode);
+            const target = this.runtime.getTargetById(request.targetId) || this.vm.editingTarget;
+            if (!primitive || !target) return Promise.reject(new Error('Extension target is unavailable'));
+            const Thread = require('../engine/thread');
+            const BlockUtility = require('../engine/block-utility');
+            const thread = new Thread(request.opcode);
+            thread.target = target;
+            thread.pushStack(request.opcode);
+            const util = new BlockUtility(this.runtime.sequencer, thread);
+            return Promise.resolve().then(() => primitive(request.args || {}, util));
+        }
+        return require('../nyaitter/extension-api').createAPI(this.vm)
+            .readHost(request);
+    }
+
+    async loadExtensionURL (extensionURL, skipCollaboration = false) {
         if (this.isBuiltinExtension(extensionURL)) {
-            this.loadExtensionIdSync(extensionURL);
+            this.loadExtensionIdSync(extensionURL, skipCollaboration);
             return;
         }
 
@@ -223,6 +251,23 @@ class ExtensionManager {
         const sandboxMode = await this.securityManager.getSandboxMode(extensionURL);
         const rewritten = await this.securityManager.rewriteExtensionURL(extensionURL);
 
+        if (this.runtime._nditorExtensionLoader) {
+            const extensionObjects = await this.runtime._nditorExtensionLoader(rewritten, this.vm)
+                .catch(error => this._failedLoadingExtensionScript(error));
+            const workerId = this.nextExtensionWorker++;
+            this.workerURLs[workerId] = extensionURL;
+            for (const extensionObject of extensionObjects) {
+                const info = extensionObject.getInfo();
+                const serviceName = `nditor.${workerId}.${info.id}`;
+                dispatch.setServiceSync(serviceName, extensionObject);
+                dispatch.callSync('extensions', 'registerExtensionServiceSync', serviceName);
+                this._loadedExtensions.set(info.id, serviceName);
+            }
+            this._finishedLoadingExtensionScript();
+            if (!skipCollaboration) this.vm._emitCollaborationOperation?.('extension.load', {source: extensionURL});
+            return;
+        }
+
         if (sandboxMode === 'unsandboxed') {
             const {load} = require('./tw-unsandboxed-extension-runner');
             const extensionObjects = await load(rewritten, this.vm)
@@ -239,6 +284,7 @@ class ExtensionManager {
             }
 
             this._finishedLoadingExtensionScript();
+            if (!skipCollaboration) this.vm._emitCollaborationOperation?.('extension.load', {source: extensionURL});
             return;
         }
 
@@ -253,10 +299,11 @@ class ExtensionManager {
         }
         /* eslint-enable max-len */
 
-        return new Promise((resolve, reject) => {
+        await new Promise((resolve, reject) => {
             this.pendingExtensions.push({extensionURL: rewritten, resolve, reject});
             dispatch.addWorker(new ExtensionWorker());
         }).catch(error => this._failedLoadingExtensionScript(error));
+        if (!skipCollaboration) this.vm._emitCollaborationOperation?.('extension.load', {source: extensionURL});
     }
 
     /**
@@ -580,6 +627,15 @@ class ExtensionManager {
 
             blockInfo.func = (args, util) => {
                 const realBlockInfo = getBlockInfo(args);
+                if (this.runtime._nditorCollaborationRole === 'guest' && this.vm._nditorHostRead) {
+                    const extensionId = [...this._loadedExtensions].find(([, service]) => service === serviceName)?.[0];
+                    if (extensionId && !this.isBuiltinExtension(extensionId)) {
+                        return this.vm._nditorHostRead({kind: 'extension',
+                            opcode: `${extensionId}_${blockInfo.opcode}`,
+                            args,
+                            targetId: util.target.id});
+                    }
+                }
                 // TODO: filter args using the keys of realBlockInfo.arguments? maybe only if sandboxed?
                 return callBlockFunc(args, util, realBlockInfo);
             };

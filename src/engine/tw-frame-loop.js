@@ -42,7 +42,7 @@ const animationFrameWrapper = callback => {
  * @returns {boolean} true if no-op animation frame loop should be used
  */
 const shouldUseNoopAnimationFrame = framerate =>
-    framerate >= 30 && navigator.userAgent.includes('Chrome') && (
+    framerate >= 30 && typeof navigator !== 'undefined' && navigator.userAgent && navigator.userAgent.includes('Chrome') && (
         navigator.userAgent.includes('Windows') ||
         navigator.userAgent.includes('Android')
     );
