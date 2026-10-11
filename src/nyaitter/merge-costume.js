@@ -33,11 +33,17 @@ const matrix = text => {
     }
     return result;
 };
-const fingerprint = node => JSON.stringify([node.type, node.name, node.data,
+const fingerprintCache = new WeakMap();
+const fingerprint = node => {
+    if (fingerprintCache.has(node)) return fingerprintCache.get(node);
+    const value = JSON.stringify([node.type, node.name, node.data,
     Object.keys(node.attribs || {}).filter(key => key !== 'id')
         .sort()
         .map(key => [key, node.attribs[key]]),
     (node.children || []).map(fingerprint)]);
+    fingerprintCache.set(node, value);
+    return value;
+};
 const normalizeSVG = costume => {
     const text = decodeText(costume.assetData.data);
     const root = parseDOM(text, {xmlMode: true, decodeEntities: true}).find(node => node.name === 'svg');
@@ -71,16 +77,23 @@ const normalizeSVG = costume => {
 const align = (base, items) => {
     const used = new Set();
     const assigned = new Map();
-    const signatures = base.map(fingerprint);
+    const ids = new Map();
+    const signatures = new Map();
+    base.forEach((node, i) => {
+        const id = node.attribs && node.attribs.id;
+        if (id) { if (!ids.has(id)) ids.set(id, []); ids.get(id).push(i); }
+        const signature = fingerprint(node);
+        if (!signatures.has(signature)) signatures.set(signature, []);
+        signatures.get(signature).push(i);
+    });
     for (let i = 0; i < items.length; i++) {
         const item = items[i];
         const id = item.attribs && item.attribs.id;
-        let index = id ? base.findIndex((node, n) => !used.has(n) && node.attribs && node.attribs.id === id) : -1;
-        if (index < 0) {
-            const signature = fingerprint(item);
-            index = signatures.findIndex((value, n) => value === signature && !used.has(n));
+        let index = id ? (ids.get(id) || []).find(n => !used.has(n)) : undefined;
+        if (index === undefined) {
+            index = (signatures.get(fingerprint(item)) || []).find(n => !used.has(n));
         }
-        if (index >= 0) {
+        if (index !== undefined) {
             used.add(index); assigned.set(i, `b:${index}`);
         }
     }

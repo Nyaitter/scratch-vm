@@ -1015,8 +1015,15 @@ class VirtualMachine extends EventEmitter {
         if (operation.kind === 'costume.update') {
             const current = target.getCostumes()[operation.costumeIndex];
             if (!current) return;
+            const currentSerialized = serializeCollaborationCostume(current);
             const merged = await mergeCostumeUpdate(operation.baseCostume,
-                serializeCollaborationCostume(current), operation.costume, operation.canonicalCostume === true);
+                currentSerialized, operation.costume, operation.canonicalCostume === true);
+            if (merged.assetData?.data === currentSerialized?.assetData?.data &&
+                merged.assetData?.dataFormat === current.dataFormat && merged.name === current.name &&
+                merged.rotationCenterX === current.rotationCenterX && merged.rotationCenterY === current.rotationCenterY &&
+                merged.bitmapResolution === current.bitmapResolution) {
+                return currentSerialized;
+            }
             const loaded = await this._loadCollaborationCostume(merged);
             const previousSkinId = current.skinId;
             Object.keys(current).forEach(key => delete current[key]);
